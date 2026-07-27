@@ -164,6 +164,7 @@ impl App {
     pub fn new(
         mux: Arc<dyn Multiplexer>,
         cli_session_filter: bool,
+        cli_all_projects: bool,
         event_tx: mpsc::Sender<AppEvent>,
     ) -> Result<Self> {
         let config = Config::load(None)?;
@@ -289,7 +290,7 @@ impl App {
             .ok()
             .map(|p| git::get_repo_root_for(&p).is_ok())
             .unwrap_or(false);
-        if !cwd_in_repo && !app.repo_roots.is_empty() {
+        if (cli_all_projects || !cwd_in_repo) && !app.repo_roots.is_empty() {
             app.worktree_all_projects = true;
         }
 

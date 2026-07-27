@@ -98,6 +98,7 @@ pub fn run(
     open_diff: bool,
     session_filter: bool,
     tab: Option<DashboardTab>,
+    all_projects: bool,
 ) -> Result<()> {
     let mux = create_backend(detect_backend());
 
@@ -125,7 +126,7 @@ pub fn run(
     // Create app state before spawning the input thread to avoid a race condition
     // where stray terminal events (e.g. the Enter key used to launch the command)
     // get queued and processed before the app is ready.
-    let mut app = App::new(mux, session_filter, event_tx.clone())?;
+    let mut app = App::new(mux, session_filter, all_projects, event_tx.clone())?;
 
     // CLI preview size overrides config/tmux if provided
     if let Some(size) = cli_preview_size {

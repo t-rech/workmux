@@ -697,6 +697,11 @@ enum Commands {
         /// Open directly on the specified tab
         #[arg(long, short = 't', value_enum)]
         tab: Option<command::dashboard::DashboardTab>,
+
+        /// Show worktrees from every known project (see `projects:` in the
+        /// global config) instead of only the current repository's
+        #[arg(long, short = 'A')]
+        all_projects: bool,
     },
 
     /// Manage global configuration
@@ -1090,7 +1095,8 @@ pub fn run() -> Result<()> {
             diff,
             session,
             tab,
-        } => command::dashboard::run(preview_size, diff, session, tab),
+            all_projects,
+        } => command::dashboard::run(preview_size, diff, session, tab, all_projects),
         Commands::Config(args) => command::config::run(args),
         Commands::Claude { command } => match command {
             ClaudeCommands::Prune => prune_claude_config(),

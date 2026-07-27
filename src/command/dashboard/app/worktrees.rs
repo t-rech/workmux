@@ -35,6 +35,56 @@ fn ctx_for_path(
     workflow::WorkflowContext::new_in(path, config, mux, config_location)
 }
 
+/// Distinct repository roots for the all-projects enumeration, in a stable
+/// order. `repo_roots` maps observed paths (agent workdirs, configured
+/// projects) to their repo root, so several keys can share one root.
+pub(super) fn collect_all_roots(
+    repo_roots: &std::collections::HashMap<PathBuf, PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = repo_roots.values().cloned().collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Build the project picker entries from the known repo roots: one entry per
+/// distinct project name (sorted), with the synthetic all-projects entry
+/// prepended when more than one project is known.
+pub(super) fn build_project_entries(
+    repo_roots: &std::collections::HashMap<PathBuf, PathBuf>,
+) -> Vec<ProjectEntry> {
+    let mut by_name: std::collections::BTreeMap<String, PathBuf> =
+        std::collections::BTreeMap::new();
+
+    for root in repo_roots.values() {
+        let name = agent::extract_project_name(root);
+        by_name.entry(name).or_insert_with(|| root.clone());
+    }
+
+    let mut projects: Vec<ProjectEntry> = by_name
+        .into_iter()
+        .map(|(name, path)| ProjectEntry { name, path })
+        .collect();
+
+    // Synthetic first entry for the merged view. The empty path is the
+    // sentinel checked by is_all_projects_entry.
+    if projects.len() > 1 {
+        projects.insert(
+            0,
+            ProjectEntry {
+                name: ALL_PROJECTS_LABEL.to_string(),
+                path: PathBuf::new(),
+            },
+        );
+    }
+    projects
+}
+
+/// Whether a picker entry is the synthetic all-projects entry.
+pub(super) fn is_all_projects_entry(entry: &ProjectEntry) -> bool {
+    entry.path.as_os_str().is_empty()
+}
+
 /// Delete the last word from a string (Emacs Ctrl+w behavior).
 fn delete_word_backward(s: &mut String) {
     // Trim trailing whitespace first
@@ -230,10 +280,7 @@ impl App {
         // Each worktree row carries its own path, so the Project column and
         // all per-row actions stay correctly scoped per repository.
         let all_roots: Option<Vec<PathBuf>> = if self.worktree_all_projects {
-            let mut roots: Vec<PathBuf> = self.repo_roots.values().cloned().collect();
-            roots.sort();
-            roots.dedup();
-            Some(roots)
+            Some(collect_all_roots(&self.repo_roots))
         } else {
             None
         };
@@ -660,31 +707,7 @@ impl App {
 
     /// Discover projects from cached repo roots and open the picker modal.
     pub fn show_project_picker(&mut self) {
-        // Deduplicate by project name, keeping one representative path per project
-        let mut by_name: std::collections::BTreeMap<String, PathBuf> =
-            std::collections::BTreeMap::new();
-
-        for root in self.repo_roots.values() {
-            let name = agent::extract_project_name(root);
-            by_name.entry(name).or_insert_with(|| root.clone());
-        }
-
-        let mut projects: Vec<ProjectEntry> = by_name
-            .into_iter()
-            .map(|(name, path)| ProjectEntry { name, path })
-            .collect();
-
-        // Synthetic first entry for the merged view. The empty path is the
-        // sentinel checked in confirm_project_picker.
-        if projects.len() > 1 {
-            projects.insert(
-                0,
-                ProjectEntry {
-                    name: ALL_PROJECTS_LABEL.to_string(),
-                    path: PathBuf::new(),
-                },
-            );
-        }
+        let projects = build_project_entries(&self.repo_roots);
 
         let current_name = if self.worktree_all_projects {
             Some(ALL_PROJECTS_LABEL.to_string())
@@ -756,8 +779,7 @@ impl App {
         };
         let selected = &picker.projects[idx];
 
-        if selected.path.as_os_str().is_empty() {
-            // The synthetic "all projects" entry.
+        if is_all_projects_entry(selected) {
             self.worktree_all_projects = true;
             self.worktree_project_override = None;
         } else {
@@ -1371,5 +1393,265 @@ impl App {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support;
+    use anyhow::Result;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+
+    /// Minimal no-op multiplexer for context construction; none of its methods
+    /// are exercised by these tests.
+    struct StubMux;
+
+    impl Multiplexer for StubMux {
+        fn name(&self) -> &'static str {
+            "tmux"
+        }
+        fn is_running(&self) -> Result<bool> {
+            Ok(false)
+        }
+        fn current_pane_id(&self) -> Option<String> {
+            None
+        }
+        fn active_pane_id(&self) -> Option<String> {
+            None
+        }
+        fn get_client_active_pane_path(&self) -> Result<PathBuf> {
+            Ok(PathBuf::new())
+        }
+        fn create_window(
+            &self,
+            _params: crate::multiplexer::types::CreateWindowParams,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        fn create_session(
+            &self,
+            _params: crate::multiplexer::types::CreateSessionParams,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        fn switch_to_session(&self, _prefix: &str, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn kill_window(&self, _full_name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn schedule_window_close(&self, _full_name: &str, _delay: Duration) -> Result<()> {
+            Ok(())
+        }
+        fn schedule_session_close(&self, _full_name: &str, _delay: Duration) -> Result<()> {
+            Ok(())
+        }
+        fn run_deferred_script(&self, _script: &str) -> Result<()> {
+            Ok(())
+        }
+        fn shell_select_window_cmd(&self, _full_name: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn shell_kill_window_cmd(&self, _full_name: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn shell_switch_session_cmd(&self, _full_name: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn shell_kill_session_cmd(&self, _full_name: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn select_window(&self, _prefix: &str, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn current_window_name(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn get_all_window_names(&self) -> Result<HashSet<String>> {
+            Ok(HashSet::new())
+        }
+        fn wait_until_session_closed(&self, _full_session_name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn select_pane(&self, _pane_id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn switch_to_pane(&self, _pane_id: &str, _window_hint: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        fn kill_pane(&self, _pane_id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn respawn_pane(&self, _pane_id: &str, _cwd: &Path, _cmd: Option<&str>) -> Result<String> {
+            Ok(String::new())
+        }
+        fn capture_pane(&self, _pane_id: &str, _lines: u16) -> Option<String> {
+            None
+        }
+        fn send_text_fragment(&self, _pane_id: &str, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        fn send_enter(&self, _pane_id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn send_key(&self, _pane_id: &str, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        fn paste_text(&self, _pane_id: &str, _content: &str) -> Result<()> {
+            Ok(())
+        }
+        fn set_status(&self, _pane_id: &str, _icon: &str, _auto_clear_on_focus: bool) -> Result<()> {
+            Ok(())
+        }
+        fn clear_status(&self, _pane_id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn ensure_status_format(&self, _pane_id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn instance_id(&self) -> String {
+            String::new()
+        }
+        fn split_pane(
+            &self,
+            _target_pane_id: &str,
+            _direction: &crate::config::SplitDirection,
+            _cwd: &Path,
+            _size: Option<u16>,
+            _percentage: Option<u8>,
+            _command: Option<&str>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        fn get_live_pane_info(
+            &self,
+            _pane_id: &str,
+        ) -> Result<Option<crate::multiplexer::types::LivePaneInfo>> {
+            Ok(None)
+        }
+        fn get_all_live_pane_info(
+            &self,
+        ) -> Result<std::collections::HashMap<String, crate::multiplexer::types::LivePaneInfo>>
+        {
+            Ok(HashMap::new())
+        }
+    }
+
+    fn roots_map(paths: &[&Path]) -> HashMap<PathBuf, PathBuf> {
+        paths
+            .iter()
+            .map(|p| (p.to_path_buf(), p.to_path_buf()))
+            .collect()
+    }
+
+    #[test]
+    fn picker_lists_projects_from_registry_without_agents() {
+        // The registry alone (config-seeded roots, no agent records) must
+        // yield a fully populated picker: sorted project entries plus the
+        // synthetic all-projects entry first.
+        let temp = tempfile::tempdir().unwrap();
+        let svc = temp.path().join("services");
+        let cli = temp.path().join("clutch-cli");
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::create_dir_all(&cli).unwrap();
+
+        let entries = build_project_entries(&roots_map(&[&svc, &cli]));
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, ALL_PROJECTS_LABEL);
+        assert!(is_all_projects_entry(&entries[0]));
+        assert_eq!(entries[1].name, "clutch-cli");
+        assert_eq!(entries[2].name, "services");
+        assert!(!is_all_projects_entry(&entries[1]));
+        assert!(!is_all_projects_entry(&entries[2]));
+    }
+
+    #[test]
+    fn picker_omits_all_entry_for_a_single_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let only = temp.path().join("services");
+        std::fs::create_dir_all(&only).unwrap();
+
+        let entries = build_project_entries(&roots_map(&[&only]));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "services");
+        assert!(!is_all_projects_entry(&entries[0]));
+    }
+
+    #[test]
+    fn collect_all_roots_dedupes_paths_sharing_a_root() {
+        // Two observed paths (e.g. two agent workdirs) resolving to the same
+        // repo root must enumerate that root once.
+        let root = PathBuf::from("/repo");
+        let mut map = HashMap::new();
+        map.insert(PathBuf::from("/repo/wt-a"), root.clone());
+        map.insert(PathBuf::from("/repo/wt-b"), root.clone());
+        map.insert(PathBuf::from("/other"), PathBuf::from("/other"));
+
+        let roots = collect_all_roots(&map);
+
+        assert_eq!(roots, vec![PathBuf::from("/other"), root]);
+    }
+
+    #[test]
+    fn ctx_for_path_scopes_to_the_rows_repository_not_the_cwd() {
+        // Regression guard for the wrong-repo hazard: row-level actions
+        // (open/remove/sweep) must resolve their workflow context from the
+        // selected row's own path. A cwd-derived context resolves handles in
+        // whatever repo the dashboard happened to be launched from, which is
+        // wrong under a project override or the all-projects view.
+        const TEST_NAME: &str =
+            "command::dashboard::app::worktrees::tests::ctx_for_path_scopes_to_the_rows_repository_not_the_cwd";
+        if !test_support::is_isolated_child(TEST_NAME) {
+            let temp = tempfile::tempdir().unwrap();
+            let repo_a = temp.path().join("repo-a");
+            let repo_b = temp.path().join("repo-b");
+            std::fs::create_dir_all(&repo_a).unwrap();
+            std::fs::create_dir_all(&repo_b).unwrap();
+            test_support::init_repo(&repo_a);
+            test_support::init_repo(&repo_b);
+            // A worktree of repo-b, in a sibling hub dir (the row's path).
+            let hub = temp.path().join("hub__worktrees");
+            std::fs::create_dir_all(&hub).unwrap();
+            test_support::run_git(
+                &repo_b,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature-x",
+                    hub.join("feature-x").to_str().unwrap(),
+                ],
+            );
+
+            // Run the assertions with the process cwd inside repo-a — the
+            // WRONG repository on purpose.
+            test_support::run_isolated_test(TEST_NAME, &repo_a, &[("WM_TEST_TEMP", temp.path())]);
+            return;
+        }
+
+        println!("{}", test_support::ISOLATED_TEST_CANARY);
+        let temp = std::env::var_os("WM_TEST_TEMP")
+            .map(PathBuf::from)
+            .unwrap();
+        let repo_a = temp.join("repo-a");
+        let repo_b = temp.join("repo-b");
+        let row_path = temp.join("hub__worktrees").join("feature-x");
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            repo_a.canonicalize().unwrap()
+        );
+
+        let ctx = ctx_for_path(&row_path, Arc::new(StubMux)).unwrap();
+
+        assert_eq!(
+            ctx.main_worktree_root,
+            repo_b.canonicalize().unwrap(),
+            "row-scoped context must resolve the row's repository (repo-b), \
+             not the process cwd (repo-a)"
+        );
     }
 }

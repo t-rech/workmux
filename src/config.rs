@@ -5589,3 +5589,67 @@ theme:
         );
     }
 }
+
+#[cfg(test)]
+mod projects_registry_tests {
+    use super::Config;
+
+    #[test]
+    fn projects_key_parses_and_is_optional() {
+        let config: Config = serde_yaml::from_str("projects:\n  - /tmp/a\n  - /tmp/b\n").unwrap();
+        assert_eq!(
+            config.projects.as_deref().unwrap(),
+            ["/tmp/a".to_string(), "/tmp/b".to_string()]
+        );
+
+        // Absent key must stay None and yield no paths: upstream configs and
+        // repos without a registry keep working unchanged.
+        let absent: Config = serde_yaml::from_str("agent: claude").unwrap();
+        assert!(absent.projects.is_none());
+        assert!(absent.project_paths().is_empty());
+    }
+
+    #[test]
+    fn project_paths_filters_missing_dirs_and_dedupes_preserving_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("repo-a");
+        let b = temp.path().join("repo-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let missing = temp.path().join("deleted-repo");
+
+        let config = Config {
+            projects: Some(vec![
+                b.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+                a.to_string_lossy().into_owned(),
+                b.to_string_lossy().into_owned(), // duplicate
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(config.project_paths(), vec![b, a]);
+    }
+
+    #[test]
+    fn projects_merge_project_config_overrides_global() {
+        let global = Config {
+            projects: Some(vec!["/global".to_string()]),
+            ..Default::default()
+        };
+        let project = Config {
+            projects: Some(vec!["/project".to_string()]),
+            ..Default::default()
+        };
+        let merged = global.merge(project);
+        assert_eq!(merged.projects.as_deref().unwrap(), ["/project".to_string()]);
+
+        // Project config without the key inherits the global registry.
+        let global = Config {
+            projects: Some(vec!["/global".to_string()]),
+            ..Default::default()
+        };
+        let merged = global.merge(Config::default());
+        assert_eq!(merged.projects.as_deref().unwrap(), ["/global".to_string()]);
+    }
+}
