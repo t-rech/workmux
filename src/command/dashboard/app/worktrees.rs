@@ -17,6 +17,24 @@ use super::super::sort::WorktreeSortMode;
 use super::App;
 use super::types::*;
 
+/// Display name of the synthetic project-picker entry that selects the merged
+/// all-projects worktrees view.
+pub(super) const ALL_PROJECTS_LABEL: &str = "all projects";
+
+/// Build a workflow context rooted at `path` (any directory inside the target
+/// repository). Row-level actions must use this instead of a cwd-derived
+/// context: with a project override or the all-projects view active, the
+/// selected row's repository is generally NOT the repo the dashboard was
+/// launched from, and a cwd context would resolve the handle in the wrong
+/// repository (or fail).
+fn ctx_for_path(
+    path: &Path,
+    mux: Arc<dyn Multiplexer>,
+) -> anyhow::Result<workflow::WorkflowContext> {
+    let (config, config_location) = crate::config::Config::load_with_location_from(path, None)?;
+    workflow::WorkflowContext::new_in(path, config, mux, config_location)
+}
+
 /// Delete the last word from a string (Emacs Ctrl+w behavior).
 fn delete_word_backward(s: &mut String) {
     // Trim trailing whitespace first
@@ -208,6 +226,18 @@ impl App {
             .as_ref()
             .map(|(_, p)| p.clone());
 
+        // All-projects mode: enumerate every known project root and merge.
+        // Each worktree row carries its own path, so the Project column and
+        // all per-row actions stay correctly scoped per repository.
+        let all_roots: Option<Vec<PathBuf>> = if self.worktree_all_projects {
+            let mut roots: Vec<PathBuf> = self.repo_roots.values().cloned().collect();
+            roots.sort();
+            roots.dedup();
+            Some(roots)
+        } else {
+            None
+        };
+
         std::thread::spawn(move || {
             struct ResetFlag(Arc<AtomicBool>);
             impl Drop for ResetFlag {
@@ -219,7 +249,22 @@ impl App {
 
             // fetch_pr_status=false: the dashboard fetches PR status separately,
             // and workflow::list's spinner would corrupt the TUI output
-            if let Ok(worktrees) =
+            if let Some(roots) = all_roots {
+                let mut merged = Vec::new();
+                for root in roots {
+                    // A root that fails to enumerate (deleted, not a repo)
+                    // should not take down the rest of the view.
+                    match workflow::list_in(&config, mux.as_ref(), false, &[], Some(&root)) {
+                        Ok(worktrees) => merged.extend(worktrees),
+                        Err(e) => tracing::warn!(
+                            root = %root.display(),
+                            error = %e,
+                            "all-projects: skipping project root"
+                        ),
+                    }
+                }
+                let _ = tx.send(AppEvent::WorktreeList(merged));
+            } else if let Ok(worktrees) =
                 workflow::list_in(&config, mux.as_ref(), false, &[], repo_override.as_deref())
             {
                 let _ = tx.send(AppEvent::WorktreeList(worktrees));
@@ -423,8 +468,10 @@ impl App {
             .unwrap_or_default()
             .to_string();
 
-        let Ok(ctx) = workflow::WorkflowContext::new(self.config.clone(), self.mux.clone(), None)
-        else {
+        // Scope the context to the worktree's own repository, not the cwd:
+        // with a project override or the all-projects view, a cwd context
+        // would resolve `handle` in the wrong repository.
+        let Ok(ctx) = ctx_for_path(path, self.mux.clone()) else {
             return;
         };
 
@@ -571,7 +618,6 @@ impl App {
         }
 
         let total = paths_to_remove.len();
-        let config = self.config.clone();
         let mux = self.mux.clone();
         let tx = self.event_tx.clone();
 
@@ -582,17 +628,17 @@ impl App {
         });
 
         std::thread::spawn(move || {
-            let Ok(ctx) = workflow::WorkflowContext::new(config, mux, None) else {
-                let _ = tx.send(AppEvent::SweepComplete(Err(
-                    "Failed to create workflow context".to_string(),
-                )));
-                return;
-            };
-
             let mut failures = 0;
-            for (i, (handle, _path)) in paths_to_remove.iter().enumerate() {
+            for (i, (handle, path)) in paths_to_remove.iter().enumerate() {
                 let _ = tx.send(AppEvent::SweepProgressUpdate(i + 1, total, handle.clone()));
 
+                // Per-candidate context rooted at the worktree's own repo:
+                // candidates can span repositories (all-projects view), and a
+                // cwd context would resolve `handle` in the wrong one.
+                let Ok(ctx) = ctx_for_path(path, mux.clone()) else {
+                    failures += 1;
+                    continue;
+                };
                 if workflow::remove_quiet(handle, true, false, &ctx).is_err() {
                     failures += 1;
                 }
@@ -623,20 +669,35 @@ impl App {
             by_name.entry(name).or_insert_with(|| root.clone());
         }
 
-        let projects: Vec<ProjectEntry> = by_name
+        let mut projects: Vec<ProjectEntry> = by_name
             .into_iter()
             .map(|(name, path)| ProjectEntry { name, path })
             .collect();
 
-        let current_name = self
-            .worktree_project_override
-            .as_ref()
-            .map(|(name, _)| name.clone())
-            .or_else(|| {
-                self.current_worktree
-                    .as_deref()
-                    .map(agent::extract_project_name)
-            });
+        // Synthetic first entry for the merged view. The empty path is the
+        // sentinel checked in confirm_project_picker.
+        if projects.len() > 1 {
+            projects.insert(
+                0,
+                ProjectEntry {
+                    name: ALL_PROJECTS_LABEL.to_string(),
+                    path: PathBuf::new(),
+                },
+            );
+        }
+
+        let current_name = if self.worktree_all_projects {
+            Some(ALL_PROJECTS_LABEL.to_string())
+        } else {
+            self.worktree_project_override
+                .as_ref()
+                .map(|(name, _)| name.clone())
+                .or_else(|| {
+                    self.current_worktree
+                        .as_deref()
+                        .map(agent::extract_project_name)
+                })
+        };
 
         let initial_cursor = current_name
             .as_ref()
@@ -695,7 +756,15 @@ impl App {
         };
         let selected = &picker.projects[idx];
 
-        self.worktree_project_override = Some((selected.name.clone(), selected.path.clone()));
+        if selected.path.as_os_str().is_empty() {
+            // The synthetic "all projects" entry.
+            self.worktree_all_projects = true;
+            self.worktree_project_override = None;
+        } else {
+            self.worktree_all_projects = false;
+            self.worktree_project_override =
+                Some((selected.name.clone(), selected.path.clone()));
+        }
         self.worktrees.clear();
         self.all_worktrees.clear();
         self.last_worktree_fetch = std::time::Instant::now();
@@ -868,13 +937,13 @@ impl App {
 
         let handle = worktree.handle.clone();
 
-        let Ok(ctx) = workflow::WorkflowContext::new(self.config.clone(), self.mux.clone(), None)
-        else {
+        // Scope the context to the row's own repository, not the cwd.
+        let Ok(ctx) = ctx_for_path(&worktree.path, self.mux.clone()) else {
             return;
         };
 
         let mut options = workflow::types::SetupOptions::new(false, false, true);
-        options.mode = self.config.mode();
+        options.mode = ctx.config.mode();
         if workflow::open(&handle, &ctx, options, false, None, None, None).is_ok() {
             self.should_jump = true;
         }
@@ -906,6 +975,16 @@ impl App {
 
     /// Get the repo path for the current worktree view context.
     fn worktree_repo_path(&self) -> Option<PathBuf> {
+        // In the all-projects view there is no single "current" project;
+        // project-level operations (like Add) target the selected row's repo.
+        if self.worktree_all_projects
+            && let Some(w) = self
+                .worktree_table_state
+                .selected()
+                .and_then(|i| self.worktrees.get(i))
+        {
+            return Some(w.path.clone());
+        }
         self.worktree_project_override
             .as_ref()
             .map(|(_, p)| p.clone())

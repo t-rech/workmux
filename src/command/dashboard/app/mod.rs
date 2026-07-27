@@ -139,6 +139,9 @@ pub struct App {
     pub sweep_progress: Option<SweepProgress>,
     /// Override which repo's worktrees are shown (name, git root path)
     pub worktree_project_override: Option<(String, PathBuf)>,
+    /// When true, the Worktrees tab merges worktrees from every known project
+    /// (configured `projects:` plus agent-derived roots) into one table.
+    pub worktree_all_projects: bool,
     /// Flag to prevent concurrent worktree fetches
     is_worktree_fetching: Arc<AtomicBool>,
     /// Last time worktree list was fetched
@@ -258,6 +261,7 @@ impl App {
             pending_base_picker: None,
             pending_add_worktree: None,
             worktree_project_override: None,
+            worktree_all_projects: false,
             is_worktree_fetching: Arc::new(AtomicBool::new(false)),
             // Set to past so first switch triggers immediate fetch
             last_worktree_fetch: std::time::Instant::now() - Duration::from_secs(60),
@@ -269,6 +273,25 @@ impl App {
             pending_command_palette: None,
             sweep_progress: None,
         };
+
+        // Seed the project registry from `projects:` in the config so the
+        // picker and the all-projects view work with zero live agents.
+        for root in app.config.project_paths() {
+            app.repo_roots.entry(root.clone()).or_insert(root);
+        }
+
+        // Launched outside any repo (e.g. from an anchor session): default the
+        // Worktrees tab to the merged all-projects view instead of an empty
+        // table with an unpopulated picker. Deliberately keyed off the process
+        // cwd, not `current_worktree`: the client-active-pane heuristic can
+        // resolve to an unrelated pane when no client is attached.
+        let cwd_in_repo = std::env::current_dir()
+            .ok()
+            .map(|p| git::get_repo_root_for(&p).is_ok())
+            .unwrap_or(false);
+        if !cwd_in_repo && !app.repo_roots.is_empty() {
+            app.worktree_all_projects = true;
+        }
 
         app.refresh();
 

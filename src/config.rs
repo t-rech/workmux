@@ -387,6 +387,12 @@ pub struct Config {
     #[serde(default)]
     pub worktree_dir: Option<String>,
 
+    /// Known project (repository) roots. Feeds the dashboard's project picker
+    /// and enables the all-projects worktrees view even when no agents are
+    /// running. Paths support `~`. Intended for the global config.
+    #[serde(default)]
+    pub projects: Option<Vec<String>>,
+
     /// Prefix for tmux window names (optional, defaults to "wm-")
     #[serde(default)]
     pub window_prefix: Option<String>,
@@ -2379,6 +2385,7 @@ impl Config {
             main_branch,
             base_branch,
             worktree_dir,
+            projects,
             window_prefix,
             agent,
             merge_strategy,
@@ -2725,6 +2732,20 @@ impl Config {
     /// Get default panes for a Claude project.
     fn agent_default_panes() -> Vec<PaneConfig> {
         Self::default_panes_with_primary(Some("<agent>"))
+    }
+
+    /// Configured project roots (`projects:`), tilde-expanded and filtered to
+    /// directories that exist. Order is preserved; duplicates are removed.
+    pub fn project_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut seen = std::collections::HashSet::new();
+        self.projects
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|p| crate::util::expand_tilde(p))
+            .filter(|p| p.is_dir())
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
     }
 
     /// Get the window prefix to use.
